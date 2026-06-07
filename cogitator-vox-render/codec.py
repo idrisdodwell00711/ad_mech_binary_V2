@@ -6,14 +6,22 @@ Pure standard library. Shared by the Flask web app.
   FREQ_ZERO / FREQ_ONE  : the two FSK tones
   BIT_DURATION          : seconds per bit (encode + decode must agree)
   GOLD_CODE             : frame-sync preamble
+  REPEAT_COUNT          : how many copies of the message to lay down
+  SENTINEL_BYTE / SENTINEL_REPEAT : the leading/trailing guard pattern
+                                    (e.g. 'l' * 10) bracketing each copy
 
-The Omnissiah provides.
+Repeating the payload lets a phone-recorded round-trip survive noise:
+every copy is decoded independently and a per-bit majority vote across all
+recovered copies reconstructs the message.
+
+The Omnissiah provides. Redundancy is the shield of the machine-spirit.
 """
 
 import wave
 import struct
 import math
 import io
+from collections import Counter
 
 # ───────────────────────────── CODEC PARAMETERS ─────────────────────────────
 SAMPLE_RATE   = 44100   # Hz
@@ -25,6 +33,12 @@ FULL_SCALE    = 32767
 
 GOLD_CODE = "110010011100111011001001110011101100100111001110110010011100111"
 SAMPLES_PER_BIT = int(round(SAMPLE_RATE * BIT_DURATION))
+
+# ── Redundancy / framing for noisy (phone-recorded) round-trips ──────────────
+REPEAT_COUNT    = 3      # number of full message copies laid down end-to-end
+SENTINEL_CHAR   = 'l'    # the guard character (your 'llllll...' idea)
+SENTINEL_REPEAT = 10     # how many times it's repeated each side: 'llllllllll'
+SENTINEL        = SENTINEL_CHAR * SENTINEL_REPEAT
 
 
 # ───────────────────────────── ENCODING ─────────────────────────────
@@ -60,9 +74,22 @@ def samples_to_wav_bytes(samples) -> bytes:
     return bytes(buf)
 
 
-def encode_to_wav_bytes(text: str) -> bytes:
-    """Encode text -> in-memory WAV bytes (no disk needed, ideal for web)."""
-    frame = GOLD_CODE + text_to_binary(text)
+def _wrap_payload(text: str) -> str:
+    """Bracket the message with sentinel guards: 'llllllllll Hi I am Dave llllllllll'."""
+    return f"{SENTINEL} {text} {SENTINEL}"
+
+
+def encode_to_wav_bytes(text: str, repeat: int = REPEAT_COUNT) -> bytes:
+    """Encode text -> in-memory WAV bytes.
+
+    Layout (per copy):  [GOLD_CODE][ sentinel + payload + sentinel ]
+    The whole copy is laid down `repeat` times so a noisy recording still
+    yields at least one clean — or majority-recoverable — decode.
+    """
+    wrapped = _wrap_payload(text)
+    one_copy = GOLD_CODE + text_to_binary(wrapped)
+    frame = one_copy * max(1, repeat)
+
     audio = samples_to_wav_bytes(encode_bits_to_samples(frame))
     bio = io.BytesIO()
     with wave.open(bio, 'wb') as wf:
@@ -115,7 +142,28 @@ def demodulate_bits(samples, sample_rate=SAMPLE_RATE) -> str:
     return ''.join(bits)
 
 
+def find_all_preambles(bits: str, max_errors: int = 4):
+    """Return the bit-index just AFTER every Gold-code match in the stream.
+
+    Unlike the single-shot finder, this walks the whole stream so each
+    repeated copy is located. Overlapping matches within one Gold length
+    are suppressed so we don't double-count a single preamble.
+    """
+    glen = len(GOLD_CODE)
+    starts = []
+    i = 0
+    while i <= len(bits) - glen:
+        err = sum(1 for a, b in zip(bits[i:i + glen], GOLD_CODE) if a != b)
+        if err <= max_errors:
+            starts.append(i + glen)
+            i += glen            # skip past this preamble
+        else:
+            i += 1
+    return starts
+
+
 def find_preamble(bits: str, max_errors: int = 4) -> int:
+    """Backwards-compatible single best-match finder (kept for callers/tests)."""
     glen = len(GOLD_CODE)
     best_idx, best_err = -1, glen + 1
     for i in range(0, len(bits) - glen + 1):
@@ -129,11 +177,82 @@ def find_preamble(bits: str, max_errors: int = 4) -> int:
     return best_idx + glen
 
 
+def _strip_sentinels(text: str) -> str:
+    """Recover the core message from 'llllllllll <msg> llllllllll'.
+
+    Tolerant: tolerates a few corrupted sentinel chars and missing spaces,
+    and falls back to returning the raw text if no guard pattern is found.
+    """
+    t = text
+    # Find the first run of >= (SENTINEL_REPEAT-2) sentinel chars from each end.
+    thresh = max(3, SENTINEL_REPEAT - 3)
+    runs = []
+    run_start = None
+    count = 0
+    for idx, ch in enumerate(t):
+        if ch == SENTINEL_CHAR:
+            if run_start is None:
+                run_start = idx
+            count += 1
+        else:
+            if run_start is not None and count >= thresh:
+                runs.append((run_start, idx))
+            run_start, count = None, 0
+    if run_start is not None and count >= thresh:
+        runs.append((run_start, len(t)))
+
+    if len(runs) >= 2:
+        core = t[runs[0][1]:runs[-1][0]]
+        return core.strip()
+    if len(runs) == 1:
+        # Only one guard survived — take whatever is on the longer side.
+        s, e = runs[0]
+        left, right = t[:s].strip(), t[e:].strip()
+        return right if len(right) >= len(left) else left
+    return t.strip()
+
+
+def _majority_vote(strings):
+    """Per-position majority vote across equal-ish-length decoded copies."""
+    if not strings:
+        return ''
+    if len(strings) == 1:
+        return strings[0]
+    maxlen = max(len(s) for s in strings)
+    out = []
+    for i in range(maxlen):
+        chars = [s[i] for s in strings if i < len(s)]
+        if chars:
+            out.append(Counter(chars).most_common(1)[0][0])
+    return ''.join(out)
+
+
 def decode_from_wav_bytes(data: bytes) -> dict:
     samples, fr = read_wav_samples_from_bytes(data)
     bits = demodulate_bits(samples, fr)
-    start = find_preamble(bits)
-    if start < 0:
-        return {'ok': False, 'text': '',
+
+    starts = find_all_preambles(bits)
+    if not starts:
+        return {'ok': False, 'text': '', 'copies': 0,
                 'reason': 'Litany of sync not found — corrupt or alien data.'}
-    return {'ok': True, 'text': binary_to_text(bits[start:])}
+
+    # Decode each copy: from one preamble up to the next (or end of stream).
+    bounds = starts + [len(bits)]
+    candidates = []
+    for j in range(len(starts)):
+        seg = bits[bounds[j]:bounds[j + 1]]
+        raw = binary_to_text(seg)
+        core = _strip_sentinels(raw)
+        if core:
+            candidates.append(core)
+
+    if not candidates:
+        return {'ok': False, 'text': '', 'copies': len(starts),
+                'reason': 'Preamble found but no message survived the warp.'}
+
+    # Majority-vote across copies that agree on length (the dominant length wins).
+    length_mode = Counter(len(c) for c in candidates).most_common(1)[0][0]
+    aligned = [c for c in candidates if len(c) == length_mode]
+    voted = _majority_vote(aligned) if aligned else candidates[0]
+
+    return {'ok': True, 'text': voted, 'copies': len(starts)}
